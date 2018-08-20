@@ -9,6 +9,20 @@ import org.apache.log4j.LogManager
 object FileUtils {
   val log = LogManager.getRootLogger
 
+  def mkDir(sc: SparkContext, path: String): Unit = {
+    var fileSystem: FileSystem = null
+    var conf: Configuration = null
+    conf = new Configuration()
+    fileSystem = FileSystem.get(conf)
+    val p = new Path(path)
+    val exists = fileSystem.exists(p)
+    
+    if(!exists){
+      fileSystem.mkdirs(p)
+    }
+    
+  }
+  
   def mergeFiles(sc: SparkContext, srcPath: String, dstPath: String, s3BucketPath: String = null): Unit = {
     var fileSystem: FileSystem = null
     var conf: Configuration = null

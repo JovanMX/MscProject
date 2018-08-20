@@ -40,7 +40,11 @@ object TuningRandomForestCCFD {
 
   def main(args: Array[String]) {
 
-    val start = System.nanoTime()
+
+    
+    /********************************************************************
+     * PARAMETERS
+     ********************************************************************/
     val log = LogManager.getRootLogger
 
     //read mandatory arguments
@@ -63,12 +67,11 @@ object TuningRandomForestCCFD {
     val minInstancesPerNode = if (args.length < 11) Array() else args(10).split(";").map(_.toInt) //Try: 1;2;5;10 . Default: 1
     val featureSubsetStrategy = if (args.length < 12) Array("auto") else args(11).split(";") //Supported: "auto", "all", "sqrt", "log2", "onethird". Default: "auto". If "auto" is set, this parameter is set based on numTrees: if numTrees == 1, set to "all"; if numTrees > 1 (forest) set to "sqrt".
     val maxBins = if (args.length < 13) Array(32) else args(12).split(";").map(_.toInt) //Try: 10;32;50;100 . Default: 32
-
     //read optional arguments
-
-    val maxMemoryInMB = if (args.length < 14) -1 else args(13).toInt //The default value is conservatively chosen to be 256 MB
-    val numPartitions = if (args.length < 15) 20 else args(14).toInt
-    val k = if (args.length < 16) 5 else args(15).toInt
+    val withSeconds = if (args.length < 14 || args(13)!="1") false else true
+    val maxMemoryInMB = if (args.length < 15) -1 else args(14).toInt //The default value is conservatively chosen to be 256 MB
+    val numPartitions = if (args.length < 16) 20 else args(15).toInt
+    val k = if (args.length < 17) 5 else args(16).toInt
     
     val s3BucketPath = "s3://ermrtccfd"
 
@@ -78,7 +81,7 @@ object TuningRandomForestCCFD {
      * maxMemoryInMB -> 256, cacheNodeIds -> false, checkpointInterval -> 10)
      */
 
-/********************************************************************
+    /********************************************************************
      * SPARK CONTEXT
      ********************************************************************/
 
@@ -88,6 +91,8 @@ object TuningRandomForestCCFD {
     //    val sc = new SparkContext(conf);
     val sparkSession = SparkSession.builder().getOrCreate();
     val sc = sparkSession.sparkContext
+    
+    
     val df = new SimpleDateFormat("dd/MM/yyyy HH:mm:ss:SSSSSSS");
     val executionTime = df.format(new Date(System.currentTimeMillis()))
 
@@ -96,15 +101,16 @@ object TuningRandomForestCCFD {
     FileUtils.createIfNotExists(sc, intermediateDir + "metric_evaluation_tuning.csv")
     
 
-    // Read the CSV Dataset, keeping only those columns that we need to build our model
+    // Read the CSV Dataset
     val dataset = sparkSession.read
       .format("csv")
       .option("header", true)
       .option("delimiter", ",")
       .option("mode", "DROPMALFORMED")
-      .schema(schema)
-      .load(inputDir + "creditcard_cleaned_shorten_withids.csv");
-
+      .schema(if(withSeconds)schemaWithSeconds else schemaNoSeconds)
+      .load(inputDir + (if(withSeconds) "creditcard_transactions_ws.csv" else "creditcard_transactions.csv"));
+    
+    
     val testPtg = 1 - trainPtg
     /*
      * Split data into training and test
@@ -116,7 +122,12 @@ object TuningRandomForestCCFD {
     testData.write.mode(SaveMode.Overwrite).csv(intermediateDir + "creditcard_test_partition_intermediate.csv")
     FileUtils.mergeFiles(sc, intermediateDir + "creditcard_test_partition_intermediate.csv", intermediateDir + "creditcard_test_partition.csv", s3BucketPath)
     
-    val assembler = new VectorAssembler().setInputCols(Array("V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "V11", "V12", "V13", "V14", "V15", "V16", "V17", "V18", "V19", "V20", "V21", "V22", "V23", "V24", "V25", "V26", "V27", "V28", "Amount")).setOutputCol("features")
+    
+    val assembler = if(withSeconds) new VectorAssembler().setInputCols(Array("NumericSecondDay","V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "V11", "V12", "V13", "V14", "V15", "V16", "V17", "V18", "V19", "V20", "V21", "V22", "V23", "V24", "V25", "V26", "V27", "V28", "Amount")).setOutputCol("features")
+      else new VectorAssembler().setInputCols(Array("V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "V11", "V12", "V13", "V14", "V15", "V16", "V17", "V18", "V19", "V20", "V21", "V22", "V23", "V24", "V25", "V26", "V27", "V28", "Amount")).setOutputCol("features")
+    
+      
+    
 
 /********************************************************************
      * Iteration of sampling ratios
@@ -138,7 +149,7 @@ object TuningRandomForestCCFD {
      */
 
       val unsersampledData = applyRandomUndersampling(trainingData, undersamplingRatio)
-      val finalTrainingData = applySMOTE(sc, unsersampledData, intermediateDir, oversamplingRatio, numPartitions, k)
+      val finalTrainingData = applySMOTE(sc, unsersampledData, intermediateDir, oversamplingRatio, numPartitions, k, withSeconds)
 
       // Train a RandomForest model.
       val rf = new RandomForestClassifier()
@@ -325,16 +336,18 @@ object TuningRandomForestCCFD {
       bestModel._2.write.overwrite().save(modelOutputDirectory + "randomForestClassifier")
     }
     //Delete temporal data
-    FileUtils.deleteDirectory(sc, intermediateDir + "creditcard_training_data_beforeSMOTE_final.csv")
-    FileUtils.deleteDirectory(sc, intermediateDir + "creditcard_training_data_SMOTE_final.csv.csv")
+    FileUtils.deleteFile(sc, intermediateDir + "creditcard_training_data_beforeSMOTE_final.csv")
+    FileUtils.deleteFile(sc, intermediateDir + "creditcard_training_data_SMOTE_final.csv")
     
   }
 
-  def applySMOTE(sc: SparkContext, trainingData: DataFrame, outputDir: String, oversamplingRate: Int, numPartitions: Int, k: Int): DataFrame = {
+  def applySMOTE(sc: SparkContext, trainingData: DataFrame, outputDir: String, oversamplingRate: Int, numPartitions: Int, k: Int, withSeconds : Boolean): DataFrame = {
     if (oversamplingRate == 0.0)
       return trainingData
 
-    val reorderedColumnNames: Array[String] = Array("Class", "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "V11", "V12", "V13", "V14", "V15", "V16", "V17", "V18", "V19", "V20", "V21", "V22", "V23", "V24", "V25", "V26", "V27", "V28", "Amount")
+    val reorderedColumnNamesWithSeconds: Array[String] = Array("Class", "NumericSecondDay", "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "V11", "V12", "V13", "V14", "V15", "V16", "V17", "V18", "V19", "V20", "V21", "V22", "V23", "V24", "V25", "V26", "V27", "V28", "Amount")
+    val reorderedColumnNamesNoSeconds: Array[String] = Array("Class", "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "V11", "V12", "V13", "V14", "V15", "V16", "V17", "V18", "V19", "V20", "V21", "V22", "V23", "V24", "V25", "V26", "V27", "V28", "Amount")
+    val reorderedColumnNames = if(withSeconds) reorderedColumnNamesWithSeconds else reorderedColumnNamesNoSeconds
     val reorderedTrainingData = trainingData.select(reorderedColumnNames.head, reorderedColumnNames.tail: _*)
 
     reorderedTrainingData.write.mode(SaveMode.Overwrite).csv(outputDir + "creditcard_training_data_beforeSMOTE.csv")
@@ -351,14 +364,14 @@ object TuningRandomForestCCFD {
       .option("header", false)
       .option("delimiter", ",")
       .option("mode", "DROPMALFORMED")
-      .schema(schemaOversampled)
+      .schema(if(withSeconds)schemaOversampledWithSeconds else schemaOversampledNoSeconds)
       .load(outputDir + "creditcard_training_data_SMOTE_final.csv");
 
     oversampledDataset
   }
 
   def applyRandomUndersampling(trainingDataset: DataFrame, undersamplingRatio: Double): DataFrame = {
-    if (undersamplingRatio == 1.0)
+    if (undersamplingRatio == 1.0 || undersamplingRatio == 0.0)
       return trainingDataset
 
     trainingDataset.cache()
@@ -368,11 +381,49 @@ object TuningRandomForestCCFD {
 
     val undersampleTrainingNegatives = trainingNegatives.sample(false, undersamplingRatio)
 
-    trainingPositives.unionAll(undersampleTrainingNegatives)
+    trainingPositives.union(undersampleTrainingNegatives)
 
   }
+  
+  
   // Define the CSV Dataset Schema
-  val schema = new StructType(Array(
+  val schemaWithSeconds = new StructType(Array(
+    StructField("ID", LongType, true),
+    StructField("NumericSecondDay", IntegerType, true),
+    StructField("V1", DoubleType, true),
+    StructField("V2", DoubleType, true),
+    StructField("V3", DoubleType, true),
+    StructField("V4", DoubleType, true),
+    StructField("V5", DoubleType, true),
+    StructField("V6", DoubleType, true),
+    StructField("V7", DoubleType, true),
+    StructField("V8", DoubleType, true),
+    StructField("V9", DoubleType, true),
+    StructField("V10", DoubleType, true),
+    StructField("V11", DoubleType, true),
+    StructField("V12", DoubleType, true),
+    StructField("V13", DoubleType, true),
+    StructField("V14", DoubleType, true),
+    StructField("V15", DoubleType, true),
+    StructField("V16", DoubleType, true),
+    StructField("V17", DoubleType, true),
+    StructField("V18", DoubleType, true),
+    StructField("V19", DoubleType, true),
+    StructField("V20", DoubleType, true),
+    StructField("V21", DoubleType, true),
+    StructField("V22", DoubleType, true),
+    StructField("V23", DoubleType, true),
+    StructField("V24", DoubleType, true),
+    StructField("V25", DoubleType, true),
+    StructField("V26", DoubleType, true),
+    StructField("V27", DoubleType, true),
+    StructField("V28", DoubleType, true),
+    StructField("Amount", DoubleType, true),
+    StructField("Class", IntegerType, false)));
+  
+  
+  // Define the CSV Dataset Schema
+  val schemaNoSeconds = new StructType(Array(
     StructField("ID", LongType, true),
     StructField("V1", DoubleType, true),
     StructField("V2", DoubleType, true),
@@ -404,10 +455,45 @@ object TuningRandomForestCCFD {
     StructField("V28", DoubleType, true),
     StructField("Amount", DoubleType, true),
     StructField("Class", IntegerType, false)));
+  
+  
   // Define the CSV Dataset Schema
-  val schemaOversampled = new StructType(Array(
+  val schemaOversampledWithSeconds = new StructType(Array(
     StructField("Class", IntegerType, false),
-    //StructField("Time", LongType, true),
+    StructField("NumericSecondDay", IntegerType, true),
+    StructField("V1", DoubleType, true),
+    StructField("V2", DoubleType, true),
+    StructField("V3", DoubleType, true),
+    StructField("V4", DoubleType, true),
+    StructField("V5", DoubleType, true),
+    StructField("V6", DoubleType, true),
+    StructField("V7", DoubleType, true),
+    StructField("V8", DoubleType, true),
+    StructField("V9", DoubleType, true),
+    StructField("V10", DoubleType, true),
+    StructField("V11", DoubleType, true),
+    StructField("V12", DoubleType, true),
+    StructField("V13", DoubleType, true),
+    StructField("V14", DoubleType, true),
+    StructField("V15", DoubleType, true),
+    StructField("V16", DoubleType, true),
+    StructField("V17", DoubleType, true),
+    StructField("V18", DoubleType, true),
+    StructField("V19", DoubleType, true),
+    StructField("V20", DoubleType, true),
+    StructField("V21", DoubleType, true),
+    StructField("V22", DoubleType, true),
+    StructField("V23", DoubleType, true),
+    StructField("V24", DoubleType, true),
+    StructField("V25", DoubleType, true),
+    StructField("V26", DoubleType, true),
+    StructField("V27", DoubleType, true),
+    StructField("V28", DoubleType, true),
+    StructField("Amount", DoubleType, true)));
+  
+  
+  val schemaOversampledNoSeconds = new StructType(Array(
+    StructField("Class", IntegerType, false),
     StructField("V1", DoubleType, true),
     StructField("V2", DoubleType, true),
     StructField("V3", DoubleType, true),

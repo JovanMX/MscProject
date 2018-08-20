@@ -25,6 +25,7 @@ import org.apache.spark.SparkContext._
 import org.apache.spark.SparkConf
 import uk.ac.manchester.rtccfd.spark2.utils.CommonUtils
 import uk.ac.manchester.rtccfd.spark2.utils.FileUtils
+import org.apache.spark.sql.types.StringType
 
 object MetricsEvaluation {
   val logger = LogManager.getRootLogger
@@ -45,16 +46,23 @@ object MetricsEvaluation {
     val sc = new SparkContext(conf);
     val sparkSession = SparkSession.builder().getOrCreate();
     import sparkSession.implicits._;
-
-    val predictions = sparkSession.read.parquet(directory+"predictions.parquet")
+    
+    val predictions = sparkSession.read
+      .format("csv")
+      .option("header", false)
+      .option("delimiter", ",")
+      .option("mode", "DROPMALFORMED")
+      .schema(schema)
+      .load(directory+"predictions.csv");
     
     
           //Evaluation metrics
       val metrics = new MulticlassMetrics(predictions.select("predictedLabel", "label").rdd.
         map(x =>
-          (x.get(0).asInstanceOf[String].toDouble, x.get(1).asInstanceOf[Double])))
-      val cfm = metrics.confusionMatrix
-
+          
+          (x.get(0).asInstanceOf[Double], x.get(1).asInstanceOf[Double])))
+      
+      val cfm = metrics.confusionMatrix      
       val tn = cfm(0, 0)
       val fp = cfm(0, 1)
       val fn = cfm(1, 0)
@@ -90,8 +98,8 @@ object MetricsEvaluation {
     val sensitivity = (tp / (tp + fn))
     val specificity = (fp / (fp + tn))
 
-    predictions.write.mode(SaveMode.Overwrite).csv(directory + "predictions_partitioned.csv")
-    FileUtils.mergeFiles(sc, directory + "predictions_partitioned.csv", directory + "predictions.csv")
+//    predictions.write.mode(SaveMode.Overwrite).csv(directory + "predictions_partitioned.csv")
+    FileUtils.mergeFiles(sc, directory + "predictions.csv", directory + "predictions_joined.csv")
 
     //Create file for results if not exists
     FileUtils.createIfNotExists(sc, directory + "metric_evaluation_test.csv")
@@ -105,10 +113,10 @@ object MetricsEvaluation {
         .append(sensitivity).append(",")
         .append(specificity).append(",")
         .append(areaUnderROC).append(",")
-        .append(areaUnderPR).append(",").toString()
+        .append(areaUnderPR).toString()
     FileUtils.appendLineToFile(sc, directory + "metric_evaluation_test.csv", evaluationResults)
     FileUtils.copyToLocal(sc, directory + "metric_evaluation_test.csv", localDirectory+ "metric_evaluation_test.csv")
-    FileUtils.copyToLocal(sc, directory + "predictions.csv", localDirectory+ "predictions.csv")
+    FileUtils.copyToLocal(sc, directory + "predictions_joined.csv", localDirectory+ "predictions_joined.csv")
 
 //    
 //    println("accuracy: "+accuracy)
@@ -122,5 +130,16 @@ object MetricsEvaluation {
 //    logger.warn("Num. Transactions = " + predictions.count())
 
   }
+  
+  
+  // Define the CSV Dataset Schema
+  val schema = new StructType(Array(
+    StructField("uuid", StringType, true),
+    StructField("id", LongType, true),
+    StructField("prediction", DoubleType, true),
+    StructField("predictedLabel", DoubleType, true),
+    StructField("label", DoubleType, true),
+    StructField("incoming_time", LongType, true),
+    StructField("prediction_time", LongType, true)));
   
 }
